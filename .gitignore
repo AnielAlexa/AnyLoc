@@ -154,3 +154,6 @@ imagebind_repo
 AnyLoc2023-Public-Data/
 *.pth
 tensorrt_models/
+
+# Ignore png files
+*.png

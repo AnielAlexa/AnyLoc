@@ -1,0 +1,98 @@
+{
+  "satellite_004": {
+    "image_path": "mock_drone_test/satellite_images/satellite_004.png",
+    "gps": {
+      "lat": 40.759899999999995,
+      "lon": -73.9851,
+      "altitude": 100,
+      "timestamp": "2024-01-15T14:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 0
+  },
+  "satellite_002": {
+    "image_path": "mock_drone_test/satellite_images/satellite_002.png",
+    "gps": {
+      "lat": 40.7589,
+      "lon": -73.98310000000001,
+      "altitude": 100,
+      "timestamp": "2024-01-15T12:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 1
+  },
+  "satellite_000": {
+    "image_path": "mock_drone_test/satellite_images/satellite_000.png",
+    "gps": {
+      "lat": 40.7589,
+      "lon": -73.9851,
+      "altitude": 100,
+      "timestamp": "2024-01-15T10:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 2
+  },
+  "satellite_003": {
+    "image_path": "mock_drone_test/satellite_images/satellite_003.png",
+    "gps": {
+      "lat": 40.7589,
+      "lon": -73.9821,
+      "altitude": 100,
+      "timestamp": "2024-01-15T13:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 3
+  },
+  "satellite_005": {
+    "image_path": "mock_drone_test/satellite_images/satellite_005.png",
+    "gps": {
+      "lat": 40.759899999999995,
+      "lon": -73.9841,
+      "altitude": 100,
+      "timestamp": "2024-01-15T15:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 4
+  },
+  "satellite_006": {
+    "image_path": "mock_drone_test/satellite_images/satellite_006.png",
+    "gps": {
+      "lat": 40.759899999999995,
+      "lon": -73.98310000000001,
+      "altitude": 100,
+      "timestamp": "2024-01-15T16:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 5
+  },
+  "satellite_001": {
+    "image_path": "mock_drone_test/satellite_images/satellite_001.png",
+    "gps": {
+      "lat": 40.7589,
+      "lon": -73.9841,
+      "altitude": 100,
+      "timestamp": "2024-01-15T11:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 6
+  },
+  "satellite_007": {
+    "image_path": "mock_drone_test/satellite_images/satellite_007.png",
+    "gps": {
+      "lat": 40.759899999999995,
+      "lon": -73.9821,
+      "altitude": 100,
+      "timestamp": "2024-01-15T17:00:00Z",
+      "zoom_level": 18,
+      "source": "synthetic"
+    },
+    "feature_idx": 7
+  }
+}

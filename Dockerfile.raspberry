@@ -1,0 +1,83 @@
+# Dockerfile for AnyLoc Drone Navigation on Raspberry Pi 4/5
+# Heavily optimized for ARM64 CPU-only inference
+
+# Use lightweight ARM64 Python base
+FROM python:3.9-slim-bullseye
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+
+# Install system dependencies (minimal for RPi)
+RUN apt-get update && apt-get install -y \
+    # Build essentials (minimal)
+    build-essential \
+    cmake \
+    git \
+    wget \
+    # Computer vision (lightweight)
+    libopencv-dev \
+    python3-opencv \
+    # Math libraries (CPU optimized)
+    libopenblas-dev \
+    liblapack-dev \
+    libeigen3-dev \
+    # Graphics (minimal)
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    # Cleanup aggressively
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Set working directory
+WORKDIR /opt/anyloc
+
+# Copy requirements for RPi (CPU-only, minimal)
+COPY requirements.raspberry.txt /opt/anyloc/
+COPY setup_raspberry_env.sh /opt/anyloc/
+
+# Install minimal Python dependencies
+RUN pip3 install --upgrade pip setuptools wheel && \
+    pip3 install --no-cache-dir -r requirements.raspberry.txt
+
+# Install CPU-only PyTorch (much smaller)
+RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Install CPU-only FAISS
+RUN pip3 install --no-cache-dir faiss-cpu
+
+# Copy minimal AnyLoc source (only essentials)
+COPY utilities.py /opt/anyloc/
+COPY configs.py /opt/anyloc/
+COPY raspberry_drone_navigation.py /opt/anyloc/
+COPY raspberry_optimization.py /opt/anyloc/
+
+# Create directories
+RUN mkdir -p /opt/anyloc/missions && \
+    mkdir -p /opt/anyloc/cache && \
+    mkdir -p /opt/anyloc/logs && \
+    mkdir -p /opt/anyloc/config
+
+# Set up permissions
+RUN chmod +x /opt/anyloc/setup_raspberry_env.sh
+
+# Download smallest DINOv2 model (vits14 only)
+RUN python3 -c "import torch; torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')"
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash pi && \
+    chown -R pi:pi /opt/anyloc
+
+USER pi
+
+# Expose single port (minimal services)
+EXPOSE 8080
+
+# Health check (lightweight)
+HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=2 \
+    CMD python3 -c "import torch; print('CPU available')" || exit 1
+
+# Default command (CPU-optimized)
+CMD ["python3", "raspberry_drone_navigation.py", "--config", "/opt/anyloc/config/mission.yaml", "--cpu-only"]

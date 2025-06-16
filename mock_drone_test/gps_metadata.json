@@ -1,0 +1,66 @@
+{
+  "satellite_000": {
+    "lat": 40.7589,
+    "lon": -73.9851,
+    "altitude": 100,
+    "timestamp": "2024-01-15T10:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_001": {
+    "lat": 40.7589,
+    "lon": -73.9841,
+    "altitude": 100,
+    "timestamp": "2024-01-15T11:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_002": {
+    "lat": 40.7589,
+    "lon": -73.98310000000001,
+    "altitude": 100,
+    "timestamp": "2024-01-15T12:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_003": {
+    "lat": 40.7589,
+    "lon": -73.9821,
+    "altitude": 100,
+    "timestamp": "2024-01-15T13:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_004": {
+    "lat": 40.759899999999995,
+    "lon": -73.9851,
+    "altitude": 100,
+    "timestamp": "2024-01-15T14:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_005": {
+    "lat": 40.759899999999995,
+    "lon": -73.9841,
+    "altitude": 100,
+    "timestamp": "2024-01-15T15:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_006": {
+    "lat": 40.759899999999995,
+    "lon": -73.98310000000001,
+    "altitude": 100,
+    "timestamp": "2024-01-15T16:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  },
+  "satellite_007": {
+    "lat": 40.759899999999995,
+    "lon": -73.9821,
+    "altitude": 100,
+    "timestamp": "2024-01-15T17:00:00Z",
+    "zoom_level": 18,
+    "source": "synthetic"
+  }
+}

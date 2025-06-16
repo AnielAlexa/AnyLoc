@@ -1,0 +1,144 @@
+# Docker Compose for AnyLoc Drone Navigation on Jetson Orin Nano
+# Production deployment with GPU acceleration and performance monitoring
+
+version: '3.8'
+
+services:
+  # Main drone navigation service
+  drone-navigation:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    image: anyloc-drone:jetson-latest
+    container_name: anyloc-drone-nav
+    restart: unless-stopped
+    
+    # GPU acceleration
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - CUDA_VISIBLE_DEVICES=0
+      
+    # Performance optimizations
+    privileged: true
+    
+    # Network configuration
+    network_mode: host
+    
+    # Volume mounts
+    volumes:
+      # Mission data
+      - ./missions:/opt/anyloc/missions:ro
+      - ./config:/opt/anyloc/config:ro
+      
+      # Logs and cache (persistent)
+      - anyloc-logs:/opt/anyloc/logs
+      - anyloc-cache:/opt/anyloc/cache
+      
+      # Camera access (if using USB camera)
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      
+      # System monitoring
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      
+    # Port exposures
+    ports:
+      - "8080:8080"  # Navigation API
+      - "8081:8081"  # Performance monitoring
+      - "8082:8082"  # Mission upload
+      
+    # Health check
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import torch; exit(0 if torch.cuda.is_available() else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+      
+    # Resource limits (adjust for Jetson Orin Nano 8GB)
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 2G
+    
+    # Command override for different modes
+    command: ["python3", "jetson_drone_navigation.py", "--config", "/opt/anyloc/config/mission.yaml"]
+    
+  # Performance monitoring service
+  performance-monitor:
+    image: anyloc-drone:jetson-latest
+    container_name: anyloc-performance
+    restart: unless-stopped
+    
+    # Minimal GPU access for monitoring
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility,compute
+      
+    # System access for monitoring
+    privileged: true
+    pid: host
+    
+    # Network
+    network_mode: host
+    
+    # Volumes
+    volumes:
+      - anyloc-logs:/opt/anyloc/logs
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      
+    # Performance monitoring command
+    command: ["python3", "jetson_performance_monitor.py", "--port", "8081"]
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+  
+  # Mission upload service  
+  mission-uploader:
+    image: anyloc-drone:jetson-latest
+    container_name: anyloc-mission-upload
+    restart: unless-stopped
+    
+    # Network
+    network_mode: host
+    
+    # Volumes
+    volumes:
+      - ./missions:/opt/anyloc/missions
+      - anyloc-logs:/opt/anyloc/logs
+      
+    # Mission upload API
+    command: ["python3", "mission_upload_server.py", "--port", "8082"]
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+# Named volumes for persistent data
+volumes:
+  anyloc-logs:
+    driver: local
+  anyloc-cache:
+    driver: local
+
+# Networks (using host networking for performance)
+networks:
+  default:
+    external: true
+    name: host

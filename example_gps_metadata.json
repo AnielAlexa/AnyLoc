@@ -1,0 +1,26 @@
+{
+  "satellite_image_001": {
+    "lat": 40.7589,
+    "lon": -73.9851,
+    "altitude": 100,
+    "timestamp": "2024-01-15T10:30:00Z",
+    "zoom_level": 18,
+    "source": "google_maps"
+  },
+  "satellite_image_002": {
+    "lat": 40.7614,
+    "lon": -73.9776,
+    "altitude": 100,
+    "timestamp": "2024-01-15T10:35:00Z",
+    "zoom_level": 18,
+    "source": "google_maps"
+  },
+  "satellite_image_003": {
+    "lat": 40.7505,
+    "lon": -73.9934,
+    "altitude": 100,
+    "timestamp": "2024-01-15T10:40:00Z",
+    "zoom_level": 18,
+    "source": "google_maps"
+  }
+}
