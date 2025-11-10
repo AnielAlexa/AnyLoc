@@ -1,0 +1,54 @@
+# DINOv2 ViT-S Layer Testing Pipeline Configuration
+
+# Area of Interest (your coordinates)
+area:
+  min_lat: 45.78738230339377
+  max_lat: 45.79062916410083
+  min_lon: 21.189794540405273
+  max_lon: 21.19460105895996
+
+# Satellite imagery settings
+satellite:
+  zoom_level: 19                    # For 100m altitude matching (~0.30 m/pixel)
+  provider: "esri"                  # Use Esri World Imagery (free)
+  delay_between_requests: 0.15      # Rate limiting (seconds)
+  tile_size: 256                    # Standard tile size
+
+# Patch generation settings
+patches:
+  patch_size: 300                   # 640x640 pixels per patch
+  overlap: 0.5                      # 50% overlap between patches
+  output_dir: "data/patches"
+  format: "png"                     # Image format
+
+# DINOv2 ViT-S settings
+dinov2:
+  model: "dinov2_vits14"           # ViT-S/14 model
+  layers_to_test: [8, 9, 10, 11]  # Test layers 8-11 (near output)
+  facets_to_test: ["key", "query", "value"]  # Test all attention facets
+  device: "cuda"                    # Use GPU
+  image_size: 224                   # DINOv2 optimal size (divisible by 14)
+
+# VLAD settings
+vlad:
+  num_clusters: 16                  # 16 clusters (standard for AnyLoc)
+  compute_from_patches: true        # Learn clusters from satellite patches
+  dist_mode: "cosine"               # Distance metric
+  vlad_mode: "hard"                 # Hard assignment
+  intra_norm: true                  # Intra-normalization
+  cache_descriptors: true           # Cache for reuse
+
+# Video matching settings
+video:
+  path: "flight_100m.mp4"          # Video file path (relative to repo root)
+  frame_sampling: 10                # Process every 10th frame (faster testing)
+  top_k_matches: 3                  # Show top-5 matches
+  confidence_threshold: 0.3        # Minimum similarity threshold
+  show_gui: true                    # Enable GUI visualization
+  save_results: true                # Save results to JSON
+
+# Performance settings
+performance:
+  batch_size: 1                     # Batch size for inference (real-time = 1)
+  num_workers: 4                    # DataLoader workers
+  prefetch_factor: 2                # Prefetch batches

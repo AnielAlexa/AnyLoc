@@ -1,0 +1,36 @@
+# DINOv2 ViT-S Layer Testing Pipeline Requirements
+
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer vision and image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Configuration and data
+PyYAML>=6.0
+requests>=2.31.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Tensor operations
+einops>=0.7.0
+
+# FAISS for similarity search (choose one based on your hardware)
+faiss-gpu>=1.7.4  # For GPU support
+# faiss-cpu>=1.7.4  # For CPU-only systems
+
+# K-means clustering
+fast-pytorch-kmeans>=0.2.0
+
+# Note: The pipeline reuses utilities from the parent AnyLoc directory
+# Make sure the parent environment has these dependencies installed as well
