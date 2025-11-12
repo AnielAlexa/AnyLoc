@@ -25,6 +25,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utilities import DinoV2ExtractFeatures, VLAD, seed_everything
 
+try:
+    from lightglue import SuperPoint
+    SUPERPOINT_AVAILABLE = True
+except ImportError:
+    SUPERPOINT_AVAILABLE = False
+    print("⚠️  LightGlue not available - SuperPoint extraction will be skipped")
+
 
 def load_patches(patches_dir):
     """Load all patches from directory."""
@@ -69,6 +76,38 @@ def extract_features(patches, extractor, image_size=518):
     return all_descriptors
 
 
+def extract_superpoint_features(patches, device="cuda", max_keypoints=2048):
+    """Extract SuperPoint keypoints and descriptors from patches."""
+    if not SUPERPOINT_AVAILABLE:
+        return None, None
+
+    superpoint = SuperPoint(max_num_keypoints=max_keypoints).eval().to(device)
+
+    # Define transform for SuperPoint (no normalization, just to tensor)
+    transform = T.Compose([
+        T.Resize((512, 512)),
+        T.ToTensor()
+    ])
+
+    all_kpts = []
+    all_descs = []
+
+    for patch in tqdm(patches, desc="   Extracting SuperPoint", unit="img"):
+        patch_tensor = transform(patch).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            features = superpoint({"image": patch_tensor})
+
+        # Extract keypoints and descriptors
+        kpts = features.get("keypoints", torch.tensor([]).to(device))  # (1, N, 2)
+        desc = features.get("descriptors", torch.tensor([]).to(device))  # (1, N, 256)
+
+        all_kpts.append(kpts)
+        all_descs.append(desc)
+
+    return all_kpts, all_descs
+
+
 def compute_vlad(descriptors, num_clusters, output_dir, dist_mode="cosine", vlad_mode="hard", intra_norm=True):
     """Compute VLAD descriptors and save cluster centers."""
 
@@ -102,8 +141,9 @@ def compute_vlad(descriptors, num_clusters, output_dir, dist_mode="cosine", vlad
     return vlad_descriptors, vlad
 
 
-def save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_info):
-    """Save VLAD descriptors, cluster centers, and metadata."""
+def save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_info,
+                     superpoint_kpts=None, superpoint_descs=None):
+    """Save VLAD descriptors, cluster centers, SuperPoint features, and metadata."""
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -112,6 +152,11 @@ def save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_inf
 
     # Save VLAD cluster centers (required for loading later)
     torch.save(vlad.c_centers, os.path.join(output_dir, "c_centers.pt"))
+
+    # Save SuperPoint features if available
+    if superpoint_kpts is not None and superpoint_descs is not None:
+        torch.save(superpoint_kpts, os.path.join(output_dir, "superpoint_kpts.pt"))
+        torch.save(superpoint_descs, os.path.join(output_dir, "superpoint_descs.pt"))
 
     # Save patch names
     with open(os.path.join(output_dir, "patch_names.txt"), 'w') as f:
@@ -123,6 +168,7 @@ def save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_inf
         "vlad_dim": vlad_descriptors.shape[1],
         "num_clusters": vlad.num_clusters,
         "desc_dim": vlad.desc_dim,
+        "has_superpoint": superpoint_kpts is not None,
         **config_info
     }
 
@@ -161,6 +207,17 @@ def main():
 
     print(f"   Patches: {len(patches)}")
     print(f"   Configurations: {total_configs}")
+
+    # Extract SuperPoint features ONCE before processing all configurations
+    superpoint_kpts = None
+    superpoint_descs = None
+    if config.get('geometric_verification', {}).get('enabled', True) and SUPERPOINT_AVAILABLE:
+        print(f"\n🔍 Extracting SuperPoint features (one-time cost)...")
+        superpoint_kpts, superpoint_descs = extract_superpoint_features(
+            patches,
+            device=config['dinov2']['device'],
+            max_keypoints=config['geometric_verification']['max_keypoints']
+        )
 
     # Process each configuration
     config_idx = 0
@@ -206,7 +263,8 @@ def main():
                 "image_size": config['dinov2']['image_size']
             }
 
-            save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_info)
+            save_descriptors(vlad_descriptors, patch_names, vlad, output_dir, config_info,
+                           superpoint_kpts, superpoint_descs)
 
             config_time = time.time() - config_start_time
             print(f"   Time: {config_time:.1f}s")

@@ -28,6 +28,80 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utilities import DinoV2ExtractFeatures, VLAD, seed_everything
 
+try:
+    from lightglue import SuperPoint, LightGlue
+    LIGHTGLUE_AVAILABLE = True
+except ImportError:
+    LIGHTGLUE_AVAILABLE = False
+
+try:
+    from copy import deepcopy
+    sys.path.insert(0, str(Path(__file__).parent / "EfficientLoFTR"))
+    from src.loftr import LoFTR, opt_default_cfg, reparameter
+    EFFICIENTLOFTR_AVAILABLE = True
+except ImportError:
+    EFFICIENTLOFTR_AVAILABLE = False
+    print("⚠️  EfficientLoFTR not available - using SuperPoint+LightGlue only")
+
+
+# MatchAnything preprocessing functions (from official repo)
+def process_resize(w, h, resize=None, df=None):
+    """Calculate new dimensions divisible by df."""
+    if resize is not None:
+        assert(len(resize) > 0 and len(resize) <= 2)
+        if len(resize) == 1 and resize[0] > -1:
+            scale = resize[0] / max(h, w)
+            w_new, h_new = int(round(w*scale)), int(round(h*scale))
+        elif len(resize) == 1 and resize[0] == -1:
+            w_new, h_new = w, h
+        else:  # len(resize) == 2
+            w_new, h_new = resize[0], resize[1]
+    else:
+        w_new, h_new = w, h
+
+    if df is not None:
+        w_new, h_new = map(lambda x: int(x // df * df), [w_new, h_new])
+    return w_new, h_new
+
+
+def resize_image_pil(image, size):
+    """Resize image using PIL LANCZOS."""
+    import PIL.Image
+    resized = PIL.Image.fromarray(image.astype(np.uint8))
+    resized = resized.resize(size, resample=PIL.Image.LANCZOS)
+    return np.asarray(resized, dtype=image.dtype)
+
+
+def pad_bottom_right(inp, pad_size, ret_mask=False):
+    """Pad image to square size, optionally return mask."""
+    assert isinstance(pad_size, int) and pad_size >= max(inp.shape[-2:])
+    mask = None
+    if inp.ndim == 2:
+        padded = np.zeros((pad_size, pad_size), dtype=inp.dtype)
+        padded[:inp.shape[0], :inp.shape[1]] = inp
+        if ret_mask:
+            mask = np.zeros((pad_size, pad_size), dtype=bool)
+            mask[:inp.shape[0], :inp.shape[1]] = True
+    else:
+        raise NotImplementedError()
+    return padded, mask
+
+
+def resize_and_pad(img, df=32, padding=True):
+    """MatchAnything preprocessing: resize to multiples of df and pad."""
+    h, w = img.shape[:2]
+    w_new, h_new = process_resize(w, h, resize=None, df=df)
+    img_new = resize_image_pil(img, (w_new, h_new)) if (w_new, h_new) != (w, h) else img
+
+    # Calculate scales for later keypoint correction
+    h_scale, w_scale = h / img_new.shape[0], w / img_new.shape[1]
+
+    mask = None
+    if padding and df is not None:
+        img_new, mask = pad_bottom_right(img_new, max(h_new, w_new), ret_mask=True)
+
+    return img_new, (h_scale, w_scale), mask
+
 
 class VideoMatcherGUI:
     """GUI for real-time video matching."""
@@ -50,6 +124,18 @@ class VideoMatcherGUI:
         self.current_frame_idx = 0
         self.total_frames = 0
         self.results = {}
+
+        # SuperPoint + LightGlue
+        self.superpoint = None
+        self.lightglue = None
+        self.superpoint_kpts = None
+        self.superpoint_descs = None
+        self.current_frame = None
+
+        # EfficientLoFTR
+        self.efficientloftr_matcher = None
+        self.matcher_type = None
+        self.patch_images = []  # Store patch PIL images for EfficientLoFTR
 
         # Load GPS metadata
         self.load_gps_metadata()
@@ -160,11 +246,11 @@ class VideoMatcherGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Best match display
-        match_frame = ttk.LabelFrame(right_frame, text="Best Match", padding=5)
+        # Top 3 matches display
+        match_frame = ttk.LabelFrame(right_frame, text="Top 3 Matches", padding=5)
         match_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.match_label = ttk.Label(match_frame, text="No match yet",
+        self.match_label = ttk.Label(match_frame, text="No matches yet",
                                     background="gray")
         self.match_label.pack(fill=tk.BOTH, expand=True)
 
@@ -220,6 +306,109 @@ class VideoMatcherGUI:
             cache_dir=desc_dir
         )
         self.vlad.fit(None)  # Load from cache
+
+        # Determine matcher type from config
+        self.matcher_type = self.config.get('geometric_verification', {}).get('matcher', 'superpoint_lightglue')
+
+        # Load appropriate matcher
+        if self.matcher_type == "superpoint_lightglue" and LIGHTGLUE_AVAILABLE:
+            sp_kpts_path = os.path.join(desc_dir, "superpoint_kpts.pt")
+            sp_descs_path = os.path.join(desc_dir, "superpoint_descs.pt")
+
+            if os.path.exists(sp_kpts_path) and os.path.exists(sp_descs_path):
+                self.superpoint_kpts = torch.load(sp_kpts_path)
+                self.superpoint_descs = torch.load(sp_descs_path)
+
+                # Initialize SuperPoint and LightGlue with more keypoints but higher quality
+                self.superpoint = SuperPoint(
+                    max_num_keypoints=4096,  # More keypoints
+                    detection_threshold=0.001  # Lower threshold = more keypoints detected
+                ).eval().to(self.config['dinov2']['device'])
+                self.lightglue = LightGlue(
+                    features="superpoint",
+                    filter_threshold=0.5  # Higher = more confident matches only
+                ).eval().to(self.config['dinov2']['device'])
+
+                print(f"✓ SuperPoint+LightGlue loaded")
+
+        elif self.matcher_type == "efficientloftr" and EFFICIENTLOFTR_AVAILABLE:
+            # Load EfficientLoFTR native implementation
+
+            # Determine which weight variant to use
+            variant = self.config.get('geometric_verification', {}).get('efficientloftr_variant', 'outdoor')
+            weights_map = {
+                'outdoor': 'eloftr_outdoor.ckpt',
+                'matchanything': 'matchanything_eloftr.ckpt'
+            }
+
+            if variant not in weights_map:
+                print(f"⚠️  Unknown EfficientLoFTR variant: '{variant}', defaulting to 'outdoor'")
+                variant = 'outdoor'
+
+            print(f"Loading EfficientLoFTR-opt model (variant: {variant})...")
+
+            # Load config for 'opt' variant (fast)
+            _default_cfg = deepcopy(opt_default_cfg)
+
+            # Check if we should use MatchAnything's tuned config
+            use_ma_config = self.config.get('geometric_verification', {}).get('efficientloftr_use_matchanything_config', False)
+
+            if use_ma_config and variant == 'matchanything':
+                # Apply MatchAnything's research-tuned settings (from eloftr_model.py)
+                print(f"   Applying MatchAnything tuned config...")
+                _default_cfg['match_coarse']['match_type'] = 'dual_softmax'  # More robust than skip_softmax
+                _default_cfg['match_coarse']['skip_softmax'] = False
+                _default_cfg['match_coarse']['force_nearest'] = True  # Prevent bad matches
+                _default_cfg['match_coarse']['dsmax_temperature'] = 0.1  # Sharpness
+                _default_cfg['match_coarse']['thr'] = self.config.get('geometric_verification', {}).get('efficientloftr_threshold', 0.15)
+                print(f"   • Match type: dual_softmax")
+                print(f"   • Force nearest: True")
+                print(f"   • Temperature: 0.1")
+                print(f"   • Threshold: {_default_cfg['match_coarse']['thr']} (0-1 probability scale)")
+            else:
+                # Use raw EfficientLoFTR config (legacy mode)
+                loftr_threshold = self.config.get('geometric_verification', {}).get('efficientloftr_threshold', 0.15)
+                # Note: If threshold > 1.0, it's likely using old scale (0-40), convert it
+                if loftr_threshold > 1.0:
+                    print(f"⚠️  Warning: threshold {loftr_threshold} seems to be on old scale (0-40)")
+                    print(f"   Converting to 0-1 scale by dividing by 100")
+                    loftr_threshold = loftr_threshold / 100.0
+                _default_cfg['match_coarse']['thr'] = loftr_threshold
+                print(f"   Matching threshold: {loftr_threshold} (0-1 scale)")
+
+            # Initialize matcher
+            self.efficientloftr_matcher = LoFTR(config=_default_cfg)
+
+            # Try to load weights if available
+            weights_filename = weights_map[variant]
+            weights_path = Path(__file__).parent / "EfficientLoFTR" / "weights" / weights_filename
+
+            if weights_path.exists():
+                state_dict = torch.load(weights_path, map_location='cpu')['state_dict']
+                self.efficientloftr_matcher.load_state_dict(state_dict)
+                self.efficientloftr_matcher = reparameter(self.efficientloftr_matcher)
+                print(f"✓ Loaded {variant} weights from {weights_path.name}")
+            else:
+                print(f"⚠️  Weights not found at {weights_path}")
+                print(f"   Available variants: {', '.join(weights_map.keys())}")
+                print(f"   Download from: https://github.com/zju3dv/EfficientLoFTR")
+                self.efficientloftr_matcher = None
+                self.matcher_type = "superpoint_lightglue"  # Fallback
+
+            if self.efficientloftr_matcher is not None:
+                self.efficientloftr_matcher = self.efficientloftr_matcher.eval().to(self.config['dinov2']['device'])
+
+                # Load patch images for EfficientLoFTR matching
+                patches_dir = self.config['patches']['output_dir']
+                self.patch_images = []
+                for patch_name in self.patch_names:
+                    patch_path = os.path.join(patches_dir, f"{patch_name}.png")
+                    if os.path.exists(patch_path):
+                        self.patch_images.append(Image.open(patch_path).convert('RGB'))
+                    else:
+                        self.patch_images.append(None)
+
+                print(f"✓ EfficientLoFTR loaded")
 
         self.current_config = config_name
 
@@ -314,6 +503,9 @@ class VideoMatcherGUI:
             self.play_button.config(text="▶ Play")
             return
 
+        # Save current frame for keypoint visualization
+        self.current_frame = frame.copy()
+
         # Resize for display
         display_width = 800
         h, w = frame.shape[:2]
@@ -354,7 +546,7 @@ class VideoMatcherGUI:
 
         # Update display
         self.update_info_display(top_matches, fps, proc_time)
-        self.update_match_display(top_matches[0])
+        self.update_match_display(top_matches[:3])  # Pass top 3 matches
 
         # Save result
         timestamp = self.current_frame_idx / 30.0  # Assume 30 FPS
@@ -394,33 +586,536 @@ class VideoMatcherGUI:
         # Update performance label
         self.perf_label.config(text=f"FPS: {fps:.1f} | Time: {proc_time * 1000:.1f} ms")
 
-    def update_match_display(self, best_match):
-        """Update best match satellite image display."""
+    def extract_keypoints(self, frame_img):
+        """Extract SuperPoint keypoints from image."""
+        if self.superpoint is None or not LIGHTGLUE_AVAILABLE:
+            return None, None
+
+        transform = T.Compose([
+            T.Resize((512, 512)),
+            T.ToTensor()
+        ])
+
+        img_tensor = transform(frame_img).unsqueeze(0).to(self.config['dinov2']['device'])
+
+        with torch.no_grad():
+            features = self.superpoint({"image": img_tensor})
+
+        kpts = features.get("keypoints", None)  # (1, N, 2)
+        desc = features.get("descriptors", None)  # (1, N, 256)
+
+        return kpts, desc
+
+    def draw_keypoints_and_matches(self, frame_cv, patch_cv, patch_idx):
+        """Draw SuperPoint keypoints and LightGlue matches between frame and patch."""
+        num_matches = 0
+
+        if self.superpoint is None or not LIGHTGLUE_AVAILABLE:
+            return frame_cv, patch_cv, num_matches
+
+        # Convert to PIL for keypoint extraction
+        frame_pil = Image.fromarray(cv2.cvtColor(frame_cv, cv2.COLOR_BGR2RGB))
+        patch_pil = Image.fromarray(cv2.cvtColor(patch_cv, cv2.COLOR_BGR2RGB))
+
+        # Extract keypoints
+        query_kpts, query_desc = self.extract_keypoints(frame_pil)
+        db_kpts, db_desc = self.superpoint_kpts[patch_idx], self.superpoint_descs[patch_idx]
+
+        if query_kpts is None or db_kpts is None:
+            return frame_cv, patch_cv, num_matches
+
+        # Match with LightGlue
+        with torch.no_grad():
+            matches = self.lightglue({
+                "image0": {"keypoints": query_kpts, "descriptors": query_desc},
+                "image1": {"keypoints": db_kpts, "descriptors": db_desc}
+            })
+
+        matches_idx = matches["matches"]  # Match indices
+
+        if isinstance(matches_idx, list):
+            num_matches = len(matches_idx)
+        else:
+            num_matches = matches_idx.shape[0]
+
+        # Draw keypoints on both images
+        frame_np = np.array(frame_pil)
+        patch_np = np.array(patch_pil)
+
+        # Draw query keypoints
+        if query_kpts is not None and query_kpts.shape[1] > 0:
+            kpts_np = query_kpts[0].cpu().numpy()  # (N, 2)
+            for kpt in kpts_np:
+                x, y = int(kpt[0]), int(kpt[1])
+                cv2.circle(frame_np, (x, y), 3, (0, 255, 0), -1)
+
+        # Draw database keypoints
+        if db_kpts is not None and db_kpts.shape[1] > 0:
+            kpts_np = db_kpts[0].cpu().numpy()  # (N, 2)
+            for kpt in kpts_np:
+                x, y = int(kpt[0]), int(kpt[1])
+                cv2.circle(patch_np, (x, y), 3, (0, 255, 0), -1)
+
+        # Draw match lines and highlighted circles if matches exist
+        if num_matches > 0 and not isinstance(matches_idx, list):
+            matches_np = matches_idx.cpu().numpy()
+            query_kpts_np = query_kpts[0].cpu().numpy()
+            db_kpts_np = db_kpts[0].cpu().numpy()
+
+            # Draw all matches with lines and highlighted circles
+            colors = [(255, 0, 0), (0, 255, 255), (255, 255, 0), (0, 255, 0), (255, 0, 255),
+                     (128, 0, 255), (255, 128, 0), (0, 128, 255), (255, 0, 128), (128, 255, 0)]
+
+            for idx, match in enumerate(matches_np[:min(10, len(matches_np))]):
+                q_idx, d_idx = int(match[0]), int(match[1])
+                if q_idx < len(query_kpts_np) and d_idx < len(db_kpts_np):
+                    q_kpt = query_kpts_np[q_idx]
+                    d_kpt = db_kpts_np[d_idx]
+
+                    # Use different color for each match (cycling through color list)
+                    color = colors[idx % len(colors)]
+
+                    # Draw larger circle for matched point (frame)
+                    cv2.circle(frame_np, (int(q_kpt[0]), int(q_kpt[1])), 5, color, 2)
+
+                    # Draw larger circle for matched point (patch)
+                    cv2.circle(patch_np, (int(d_kpt[0]), int(d_kpt[1])), 5, color, 2)
+
+                    # Draw correspondence line connecting to edge (simulating connection)
+                    # For visual clarity, draw colored border around matched points
+                    cv2.rectangle(frame_np,
+                                 (int(q_kpt[0])-6, int(q_kpt[1])-6),
+                                 (int(q_kpt[0])+6, int(q_kpt[1])+6),
+                                 color, 1)
+                    cv2.rectangle(patch_np,
+                                 (int(d_kpt[0])-6, int(d_kpt[1])-6),
+                                 (int(d_kpt[0])+6, int(d_kpt[1])+6),
+                                 color, 1)
+
+        return frame_np, patch_np, num_matches
+
+    def compute_homography_warp(self, patch_resized, query_kpts, query_kpts_np, db_kpts_np, matches_np, display_size=300):
+        """Compute homography from matches and warp patch image.
+
+        Note: Keypoints are extracted at 512x512 but patch is displayed at display_size x display_size.
+        We need to scale keypoints to match the display resolution.
+        """
+        if matches_np is None or len(matches_np) < 4:
+            return patch_resized, None  # Need at least 4 matches for homography
+
+        try:
+            # Scale factor: keypoints extracted at 512x512, displayed at display_size
+            kpt_size = 512
+            scale = display_size / kpt_size
+
+            # Get matched point coordinates and scale them
+            matched_query_pts = []
+            matched_db_pts = []
+
+            for match in matches_np:
+                q_idx, d_idx = int(match[0]), int(match[1])
+                if q_idx < len(query_kpts_np) and d_idx < len(db_kpts_np):
+                    # Scale keypoints from 512x512 to display_size x display_size
+                    q_pt = query_kpts_np[q_idx] * scale
+                    d_pt = db_kpts_np[d_idx] * scale
+                    matched_query_pts.append(q_pt)
+                    matched_db_pts.append(d_pt)
+
+            if len(matched_query_pts) < 4:
+                return patch_resized, None
+
+            matched_query_pts = np.array(matched_query_pts, dtype=np.float32)
+            matched_db_pts = np.array(matched_db_pts, dtype=np.float32)
+
+            # Compute homography using RANSAC
+            H, mask = cv2.findHomography(matched_db_pts, matched_query_pts, cv2.RANSAC, 5.0)
+
+            if H is None:
+                return patch_resized, H
+
+            # Warp patch image to align with frame perspective
+            warped_patch = cv2.warpPerspective(patch_resized, H,
+                                               (patch_resized.shape[1], patch_resized.shape[0]))
+
+            return warped_patch, H
+
+        except Exception as e:
+            print(f"⚠️  Homography computation failed: {e}")
+            return patch_resized, None
+
+    def update_match_display(self, top_matches):
+        """Update display with top 3 matches with keypoints and connecting lines."""
+        if not top_matches or len(top_matches) == 0:
+            return
+
+        # Process up to 3 matches
+        num_matches_to_show = min(3, len(top_matches))
+        match_images = []
+
+        for i in range(num_matches_to_show):
+            match_img = self._create_single_match_display(top_matches[i], rank=i+1)
+            if match_img is not None:
+                match_images.append(match_img)
+
+        if not match_images:
+            return
+
+        # Combine all match images horizontally
+        total_width = sum(img.width for img in match_images)
+        max_height = max(img.height for img in match_images)
+
+        combined = Image.new('RGB', (total_width, max_height), color='black')
+        x_offset = 0
+        for img in match_images:
+            combined.paste(img, (x_offset, 0))
+            x_offset += img.width
+
+        # Convert to PhotoImage
+        photo = ImageTk.PhotoImage(combined)
+        self.match_label.config(image=photo)
+        self.match_label.image = photo
+
+    def _create_single_match_display(self, best_match, rank=1):
+        """Create display for a single match with keypoints and connecting lines."""
         patch_name = best_match['patch_name']
+        patch_idx = best_match.get('idx', self.patch_names.index(patch_name) if patch_name in self.patch_names else 0)
         patch_path = os.path.join(self.config['patches']['output_dir'],
                                   f"{patch_name}.png")
 
-        if os.path.exists(patch_path):
-            patch_img = Image.open(patch_path)
+        if not os.path.exists(patch_path):
+            return None
 
-            # Resize for display
-            display_size = 400
-            patch_img = patch_img.resize((display_size, display_size), Image.Resampling.LANCZOS)
+        # Get current video frame
+        if self.current_frame is None:
+            return None
 
-            # Add confidence text
-            draw = ImageDraw.Draw(patch_img)
-            try:
-                font = ImageFont.truetype("arial.ttf", 20)
-            except:
-                font = ImageFont.load_default()
+        # Load patch
+        patch_cv = cv2.imread(patch_path)
+        if patch_cv is None:
+            return None
 
-            text = f"Confidence: {best_match['confidence']:.3f}"
-            draw.text((10, 10), text, fill=(0, 255, 0), font=font)
+        # Resize to same size for display
+        display_size = 300
+        frame_resized = cv2.resize(self.current_frame, (display_size, display_size))
+        patch_resized = cv2.resize(patch_cv, (display_size, display_size))
 
-            # Convert to PhotoImage
-            photo = ImageTk.PhotoImage(patch_img)
-            self.match_label.config(image=photo)
-            self.match_label.image = photo
+        # Initialize homography as None (will be computed if matches are found)
+        H = None
+
+        # Get keypoints and matches info
+        if self.matcher_type is None:
+            # Fallback without keypoints
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            patch_rgb = cv2.cvtColor(patch_resized, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            patch_pil = Image.fromarray(patch_rgb)
+            combined = Image.new('RGB', (620, 340), color='black')
+            combined.paste(frame_pil, (10, 10))
+            combined.paste(patch_pil, (320, 10))
+            num_matches = 0
+
+        elif self.matcher_type == "superpoint_lightglue":
+            # SuperPoint + LightGlue matching
+            frame_pil_kpt = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
+            patch_pil_kpt = Image.fromarray(cv2.cvtColor(patch_resized, cv2.COLOR_BGR2RGB))
+
+            query_kpts, query_desc = self.extract_keypoints(frame_pil_kpt)
+            db_kpts, db_desc = self.superpoint_kpts[patch_idx], self.superpoint_descs[patch_idx]
+
+            if query_kpts is not None and db_kpts is not None:
+                # Get matches
+                with torch.no_grad():
+                    matches = self.lightglue({
+                        "image0": {"keypoints": query_kpts, "descriptors": query_desc},
+                        "image1": {"keypoints": db_kpts, "descriptors": db_desc}
+                    })
+
+                matches_idx = matches["matches"]
+                match_scores = matches.get("scores", None)  # Get confidence scores
+
+                if isinstance(matches_idx, list):
+                    num_matches = len(matches_idx)
+                    matches_tensor = matches_idx[0] if num_matches > 0 else None
+                    scores_tensor = match_scores[0] if match_scores is not None and isinstance(match_scores, list) and len(match_scores) > 0 else match_scores
+                else:
+                    num_matches = matches_idx.shape[0]
+                    matches_tensor = matches_idx
+                    scores_tensor = match_scores
+
+                # Get numpy arrays
+                query_kpts_np = query_kpts[0].cpu().numpy()
+                db_kpts_np = db_kpts[0].cpu().numpy()
+                matches_np = matches_tensor.cpu().numpy() if matches_tensor is not None and num_matches > 0 else None
+                scores_np = scores_tensor.cpu().numpy() if scores_tensor is not None and num_matches > 0 else None
+
+        elif self.matcher_type == "efficientloftr":
+            # EfficientLoFTR matching (native API)
+            frame_gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+            patch_pil_orig = self.patch_images[patch_idx]
+
+            if patch_pil_orig is not None and self.efficientloftr_matcher is not None:
+                # Convert patch to grayscale CV2
+                patch_cv_orig = cv2.cvtColor(np.array(patch_pil_orig), cv2.COLOR_RGB2GRAY)
+
+                # Use MatchAnything preprocessing if enabled
+                use_ma_config = self.config.get('geometric_verification', {}).get('efficientloftr_use_matchanything_config', False)
+
+                if use_ma_config:
+                    # MatchAnything preprocessing: proper resize/pad with scale tracking
+                    frame_proc, (h_scale0, w_scale0), mask0 = resize_and_pad(frame_gray, df=32, padding=True)
+                    patch_proc, (h_scale1, w_scale1), mask1 = resize_and_pad(patch_cv_orig, df=32, padding=True)
+                    frame_gray, patch_cv_orig = frame_proc, patch_proc
+                    # Store original sizes for keypoint scaling
+                    self._frame_orig_size = frame_resized.shape[:2]
+                    self._patch_orig_size = np.array(patch_pil_orig).shape[:2]
+                else:
+                    # Legacy: simple resize to multiples of 32
+                    h0, w0 = frame_gray.shape
+                    h1, w1 = patch_cv_orig.shape
+                    frame_gray = cv2.resize(frame_gray, (w0//32*32, h0//32*32))
+                    patch_cv_orig = cv2.resize(patch_cv_orig, (w1//32*32, h1//32*32))
+                    self._frame_orig_size = None
+                    self._patch_orig_size = None
+
+                # Convert to tensors
+                img0_tensor = torch.from_numpy(frame_gray)[None][None].cuda() / 255.
+                img1_tensor = torch.from_numpy(patch_cv_orig)[None][None].cuda() / 255.
+
+                # Create batch
+                batch = {'image0': img0_tensor, 'image1': img1_tensor}
+
+                # Match with EfficientLoFTR
+                with torch.no_grad():
+                    self.efficientloftr_matcher(batch)
+
+                # Extract matches
+                mkpts0 = batch['mkpts0_f'].cpu().numpy()  # Frame keypoints (Nx2)
+                mkpts1 = batch['mkpts1_f'].cpu().numpy()  # Patch keypoints (Nx2)
+                mconf = batch['mconf'].cpu().numpy()      # Match confidence (N,)
+
+                # Post-filtering: Apply confidence threshold and top-K filtering
+                min_conf = self.config.get('geometric_verification', {}).get('efficientloftr_min_confidence', 0.0)
+                top_k = self.config.get('geometric_verification', {}).get('efficientloftr_top_k', 0)
+
+                if len(mconf) > 0 and (min_conf > 0 or top_k > 0):
+                    # Filter by minimum confidence
+                    if min_conf > 0:
+                        valid_mask = mconf > min_conf
+                        mkpts0 = mkpts0[valid_mask]
+                        mkpts1 = mkpts1[valid_mask]
+                        mconf = mconf[valid_mask]
+
+                    # Keep only top-K matches by confidence
+                    if top_k > 0 and len(mconf) > top_k:
+                        top_indices = np.argsort(mconf)[-top_k:]  # Get indices of top-K
+                        mkpts0 = mkpts0[top_indices]
+                        mkpts1 = mkpts1[top_indices]
+                        mconf = mconf[top_indices]
+
+                # Check if any matches were found after filtering
+                if len(mconf) > 0:
+                    # Post-process confidence scores for 'opt' model
+                    scores_np = (mconf - min(20.0, mconf.min())) / (max(30.0, mconf.max()) - min(20.0, mconf.min()))
+                    num_matches = len(scores_np)
+
+                    # Store for visualization
+                    query_kpts_np = mkpts0  # Frame keypoints
+                    db_kpts_np = mkpts1     # Patch keypoints
+
+                    # Create matches array (each match is [query_idx, db_idx])
+                    matches_np = np.column_stack([np.arange(num_matches), np.arange(num_matches)])
+                else:
+                    # No matches found
+                    query_kpts_np = np.array([])
+                    db_kpts_np = np.array([])
+                    matches_np = None
+                    scores_np = None
+                    num_matches = 0
+            else:
+                query_kpts_np = np.array([])
+                db_kpts_np = np.array([])
+                matches_np = None
+                scores_np = None
+                num_matches = 0
+
+        else:
+            # Unknown matcher
+            query_kpts_np = np.array([])
+            db_kpts_np = np.array([])
+            matches_np = None
+            scores_np = None
+            num_matches = 0
+
+        # Continue with visualization (same for all matchers)
+        if num_matches > 0 and matches_np is not None:
+
+                # Compute homography and warp patch
+                patch_warped = patch_resized.copy()
+
+                # Scale keypoints based on matcher type
+                if self.matcher_type == "superpoint_lightglue":
+                    # SuperPoint extracts at 512x512, need to scale to display_size
+                    kpt_size = 512
+                    scale = display_size / kpt_size
+                    query_kpts_scaled = query_kpts_np * scale
+                    db_kpts_scaled = db_kpts_np * scale
+                elif self.matcher_type == "efficientloftr":
+                    # EfficientLoFTR returns keypoints in original image coordinates
+                    # Frame was resized to display_size, patch might be different size
+                    frame_scale = display_size / frame_resized.shape[1]
+                    patch_scale = display_size / patch_resized.shape[1]
+                    query_kpts_scaled = query_kpts_np * frame_scale
+                    db_kpts_scaled = db_kpts_np * patch_scale
+                else:
+                    query_kpts_scaled = query_kpts_np
+                    db_kpts_scaled = db_kpts_np
+
+                # Compute homography if enough matches
+                if matches_np is not None and num_matches >= 4:
+                    # Extract matched points for homography
+                    matched_query_pts = []
+                    matched_db_pts = []
+                    for match in matches_np:
+                        q_idx, d_idx = int(match[0]), int(match[1])
+                        if q_idx < len(query_kpts_scaled) and d_idx < len(db_kpts_scaled):
+                            matched_query_pts.append(query_kpts_scaled[q_idx])
+                            matched_db_pts.append(db_kpts_scaled[d_idx])
+
+                    if len(matched_query_pts) >= 4:
+                        matched_query_pts = np.array(matched_query_pts, dtype=np.float32)
+                        matched_db_pts = np.array(matched_db_pts, dtype=np.float32)
+                        H, mask = cv2.findHomography(matched_db_pts, matched_query_pts, cv2.RANSAC, 5.0)
+
+                        if H is not None and mask is not None:
+                            # Check homography quality
+                            num_inliers = int(mask.sum())
+                            inlier_ratio = num_inliers / len(matched_query_pts)
+
+                            # Only use homography if we have enough inliers (at least 30% or 8+ points)
+                            if num_inliers >= max(8, int(0.3 * len(matched_query_pts))):
+                                # Additional check: verify homography doesn't produce extreme distortions
+                                try:
+                                    # Test corner warping to detect degenerate homographies
+                                    h, w = patch_resized.shape[:2]
+                                    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32).reshape(-1, 1, 2)
+                                    warped_corners = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+
+                                    # Check if warped corners are reasonable (within 2x image dimensions)
+                                    if (np.abs(warped_corners).max() < 2 * max(h, w) and
+                                        not np.isnan(warped_corners).any() and
+                                        not np.isinf(warped_corners).any()):
+                                        patch_warped = cv2.warpPerspective(patch_resized, H,
+                                                                           (patch_resized.shape[1], patch_resized.shape[0]))
+                                    else:
+                                        # Degenerate homography - don't use it
+                                        H = None
+                                except:
+                                    # Error in warping - don't use homography
+                                    H = None
+                            else:
+                                # Not enough inliers - don't use homography
+                                H = None
+
+                # If we have homography, transform the patch keypoints
+                if H is not None:
+                    # Transform db keypoints using homography
+                    db_kpts_homogeneous = np.concatenate([db_kpts_scaled, np.ones((len(db_kpts_scaled), 1))], axis=1)
+                    db_kpts_warped = (H @ db_kpts_homogeneous.T).T
+                    db_kpts_warped = db_kpts_warped[:, :2] / db_kpts_warped[:, 2:3]
+                else:
+                    db_kpts_warped = db_kpts_scaled
+
+                # Create combined canvas to draw matching lines
+                combined_cv = np.zeros((display_size, display_size * 2, 3), dtype=np.uint8)
+                combined_cv[:, :display_size] = frame_resized
+                combined_cv[:, display_size:] = patch_warped  # Use warped patch
+
+                # Draw all keypoints first (green)
+                for kpt in query_kpts_scaled:
+                    cv2.circle(combined_cv, (int(kpt[0]), int(kpt[1])), 3, (0, 255, 0), -1)
+
+                for kpt in db_kpts_warped:
+                    cv2.circle(combined_cv, (int(kpt[0]) + display_size, int(kpt[1])), 3, (0, 255, 0), -1)
+
+                # Draw matching lines with colors (ALL matches, colored by confidence)
+                if matches_np is not None and num_matches > 0:
+                    for idx, match in enumerate(matches_np):  # Draw ALL matches
+                        q_idx, d_idx = int(match[0]), int(match[1])
+                        if q_idx < len(query_kpts_scaled) and d_idx < len(db_kpts_warped):
+                            q_kpt = query_kpts_scaled[q_idx]
+                            d_kpt = db_kpts_warped[d_idx]
+
+                            # Color by confidence: green (high) -> yellow -> red (low)
+                            if scores_np is not None and idx < len(scores_np):
+                                score = scores_np[idx]
+                                # High confidence (>0.8): green
+                                # Medium confidence (0.5-0.8): yellow
+                                # Low confidence (<0.5): red
+                                if score > 0.8:
+                                    color = (0, 255, 0)  # Green
+                                elif score > 0.5:
+                                    # Interpolate between green and yellow
+                                    t = (score - 0.5) / 0.3
+                                    color = (0, 255, int(255 * (1 - t)))
+                                else:
+                                    # Interpolate between yellow and red
+                                    t = score / 0.5
+                                    color = (0, int(255 * t), 255)
+                            else:
+                                color = (255, 255, 255)  # White if no score
+
+                            # Draw line connecting the two points
+                            cv2.line(combined_cv,
+                                    (int(q_kpt[0]), int(q_kpt[1])),
+                                    (int(d_kpt[0]) + display_size, int(d_kpt[1])),
+                                    color, 1)
+
+                            # Draw larger circles at both ends
+                            cv2.circle(combined_cv, (int(q_kpt[0]), int(q_kpt[1])), 4, color, -1)
+                            cv2.circle(combined_cv, (int(d_kpt[0]) + display_size, int(d_kpt[1])), 4, color, -1)
+
+                # Convert to PIL
+                combined_rgb = cv2.cvtColor(combined_cv, cv2.COLOR_BGR2RGB)
+                combined = Image.fromarray(combined_rgb)
+        else:
+            # No matches - show fallback visualization
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            patch_rgb = cv2.cvtColor(patch_resized, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            patch_pil = Image.fromarray(patch_rgb)
+            combined = Image.new('RGB', (620, 340), color='black')
+            combined.paste(frame_pil, (10, 10))
+            combined.paste(patch_pil, (320, 10))
+
+        # Add labels
+        draw = ImageDraw.Draw(combined)
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+            small_font = ImageFont.truetype("arial.ttf", 10)
+        except:
+            font = ImageFont.load_default()
+            small_font = font
+
+        # Labels
+        draw.text((10, 315), "Video Frame", fill=(0, 255, 0), font=font)
+
+        # Indicate if patch is warped or original
+        warp_status = "WARPED" if H is not None else "ORIGINAL"
+        warp_color = (0, 255, 255) if H is not None else (255, 200, 0)
+
+        # Add rank indicator
+        rank_colors = [(255, 215, 0), (192, 192, 192), (205, 127, 50)]  # Gold, Silver, Bronze
+        rank_color = rank_colors[rank-1] if rank <= 3 else (255, 255, 255)
+        draw.text((10, 5), f"#{rank}", fill=rank_color, font=font)
+
+        draw.text((320, 315), f"{patch_name} [{warp_status}]", fill=warp_color, font=small_font)
+
+        # Info
+        conf_text = f"Conf: {best_match['confidence']:.3f} | Pts: {num_matches}"
+        draw.text((10, 330), conf_text, fill=(255, 255, 255), font=small_font)
+
+        # Return the image instead of setting it
+        return combined
 
     def update_progress(self):
         """Update progress bar."""

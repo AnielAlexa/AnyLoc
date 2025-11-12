@@ -16,8 +16,8 @@ satellite:
 
 # Patch generation settings
 patches:
-  patch_size: 300                   # 640x640 pixels per patch
-  overlap: 0.5                      # 50% overlap between patches
+  patch_size: 300                   # 640x640 pixels per patch (more context)
+  overlap: 0.75                      # 50% overlap between patches
   output_dir: "data/patches"
   format: "png"                     # Image format
 
@@ -46,6 +46,25 @@ video:
   confidence_threshold: 0.3        # Minimum similarity threshold
   show_gui: true                    # Enable GUI visualization
   save_results: true                # Save results to JSON
+
+# Geometric Verification with SuperPoint + LightGlue or EfficientLoFTR
+geometric_verification:
+  enabled: true                     # Enable/disable geometric verification refinement
+  matcher: "efficientloftr"   # Options: "superpoint_lightglue" or "efficientloftr"
+  efficientloftr_variant: "matchanything"  # Options: "outdoor" or "matchanything"
+  max_keypoints: 4096               # Max SuperPoint keypoints per image
+  match_threshold: 0.5              # LightGlue match confidence threshold
+  # EfficientLoFTR coarse matching threshold (IMPORTANT: uses 0-40 confidence score scale for raw ELoFTR)
+  # For MatchAnything with proper config, this should be 0-1 probability scale (after softmax)
+  efficientloftr_threshold: 0.15   # MatchAnything scale: 0.1-0.2 typical (was 27 on wrong scale)
+  efficientloftr_use_matchanything_config: true  # Use MatchAnything's tuned config (dual_softmax, force_nearest)
+
+  # Post-filtering (applied after matching)
+  efficientloftr_min_confidence: 0.0   # DISABLED to see all matches (was 25.0 on wrong scale)
+  efficientloftr_top_k: 0              # DISABLED - no limit (was 100)
+  ransac_threshold: 8.0             # RANSAC threshold for homography estimation
+  min_inliers: 15                   # Minimum inliers to accept match
+  refinement_top_k: 3               # Only verify top-K VLAD candidates
 
 # Performance settings
 performance:
